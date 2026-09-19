@@ -1,26 +1,20 @@
 """
-Configurazione logging cross-platform (Windows/Mac/Linux).
-I log finiscono sia su file dettagliato che, tramite callback opzionale,
-possono essere specchiati su una UI.
+Configurazione logging cross-platform. I log finiscono in ~/P2PChat/logs/.
 """
 
 import logging
-import os
 import platform
+import os
 from datetime import datetime
+
+from app_paths import LOGS_DIR, ensure_app_structure
 
 
 def setup_logging(hostname):
-    """
-    Crea un logger che scrive su file in ~/p2p_chat_logs/.
-    os.path.expanduser e os.path.join gestiscono automaticamente
-    le differenze di path tra Windows (\\) e Mac/Linux (/).
-    """
-    log_dir = os.path.join(os.path.expanduser("~"), "p2p_chat_logs")
-    os.makedirs(log_dir, exist_ok=True)
+    ensure_app_structure()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filepath = os.path.join(log_dir, f"peer_{hostname}_{timestamp}.log")
+    log_filepath = os.path.join(LOGS_DIR, f"peer_{hostname}_{timestamp}.log")
 
     logger = logging.getLogger(f"p2p_node.{hostname}")
     logger.setLevel(logging.DEBUG)

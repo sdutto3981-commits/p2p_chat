@@ -1,7 +1,5 @@
 """
-Utility di rete di basso livello: rilevamento indirizzo di broadcast,
-lettura esatta di N byte da un socket TCP (necessaria perché TCP
-può frammentare un payload in più pacchetti fisici).
+Utility di rete di basso livello.
 """
 
 import platform
@@ -10,10 +8,6 @@ import re
 
 
 def get_broadcast_address(fallback='255.255.255.255'):
-    """
-    Calcola l'indirizzo di broadcast della subnet locale.
-    Più affidabile del broadcast globale su alcune configurazioni di rete.
-    """
     try:
         if platform.system() == "Windows":
             output = subprocess.run(['ipconfig'], capture_output=True, text=True).stdout
@@ -31,11 +25,6 @@ def get_broadcast_address(fallback='255.255.255.255'):
 
 
 def recv_exact(conn, n):
-    """
-    Legge esattamente n byte da un socket TCP.
-    TCP è un protocollo a stream: un singolo .recv() non garantisce
-    di ricevere tutti i byte attesi in un colpo solo, va ciclato.
-    """
     buf = b''
     while len(buf) < n:
         chunk = conn.recv(n - len(buf))

@@ -1,6 +1,5 @@
 """
-Widget Textual che rappresenta testualmente lo stato della rete:
-nodo locale al centro, peer conosciuti sotto con IP e orario di scoperta.
+Widget Textual con rappresentazione a grafo (box-drawing Unicode).
 Si aggiorna sia in aggiunta che in rimozione (lifecycle completo).
 """
 
@@ -12,37 +11,38 @@ class GraphPanel(Static):
     def __init__(self, hostname):
         super().__init__()
         self.hostname = hostname
-        self.peers = {}  # hostname -> (ip, discovered_at_str)
+        self.peers = {}
 
     def update_peers(self, peers_snapshot):
-        """
-        peers_snapshot: dict hostname -> (ip, last_seen_timestamp)
-        proveniente da PeerNode.get_peers_snapshot()
-        """
         now = datetime.now().strftime("%H:%M:%S")
-
         for host, (ip, _last_seen) in peers_snapshot.items():
             if host not in self.peers:
                 self.peers[host] = (ip, now)
             else:
-                self.peers[host] = (ip, self.peers[host][1])  # mantieni orario di prima scoperta
-
+                self.peers[host] = (ip, self.peers[host][1])
         for host in list(self.peers.keys()):
             if host not in peers_snapshot:
                 del self.peers[host]
-
         self._refresh_view()
 
     def _refresh_view(self):
-        lines = [f"[bold red]● {self.hostname}[/bold red] (io)", ""]
+        lines = []
+        lines.append("        [bold red]┌─────────────┐[/bold red]")
+        lines.append(f"        [bold red]│ ● {self.hostname[:9]:<9} │[/bold red]  [dim](io)[/dim]")
+        lines.append("        [bold red]└──────┬──────┘[/bold red]")
+
         if not self.peers:
-            lines.append("[dim](nessun peer ancora scoperto...)[/dim]")
+            lines.append("               [dim]│[/dim]")
+            lines.append("               [dim](nessun peer)[/dim]")
         else:
-            for host, (ip, seen) in self.peers.items():
-                lines.append("  │")
-                lines.append(f"  ├── [bold green]● {host}[/bold green]")
-                lines.append(f"  │     [dim]{ip}[/dim]")
-                lines.append(f"  │     [dim]scoperto {seen}[/dim]")
+            items = list(self.peers.items())
+            for i, (host, (ip, seen)) in enumerate(items):
+                is_last = (i == len(items) - 1)
+                branch = "└──" if is_last else "├──"
+                vbar = "   " if is_last else "│  "
+                lines.append(f"               {branch}[bold green]● {host}[/bold green]")
+                lines.append(f"               {vbar}  [dim]{ip} · dal {seen}[/dim]")
+
         lines.append("")
-        lines.append(f"[dim]Totale peer: {len(self.peers)}[/dim]")
+        lines.append(f"[dim]Nodi connessi: {len(self.peers)}[/dim]")
         self.update("\n".join(lines))

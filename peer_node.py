@@ -1,10 +1,8 @@
 """
 Core P2P: discovery via broadcast UDP, handshake X25519,
 invio/ricezione di messaggi testuali e file cifrati con AES-GCM,
-e lifecycle dei peer (aggiunta + rimozione per inattività).
-
-Nessun riferimento alla UI qui dentro: comunica verso l'esterno
-solo tramite le tre callback passate al costruttore.
+lifecycle dei peer (aggiunta, rimozione per inattività, uscita volontaria),
+verifica di integrità via SHA-256, progress callback per invii grandi.
 """
 
 import socket
@@ -13,30 +11,30 @@ import json
 import base64
 import os
 import time
+import hashlib
 
 import crypto_utils
 from logger_setup import setup_logging
 from network_utils import get_broadcast_address, recv_exact
+from transfer_log import TransferLog
+from message_log import MessageLog
+from app_paths import received_dir_for_peer
 
 LISTEN_PORT = 9999
 DISCOVERY_PORT = 9998
-ANNOUNCE_INTERVAL = 3          # secondi tra un broadcast e l'altro
-PEER_TIMEOUT = 10              # secondi di silenzio prima di considerare un peer offline
-MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB, limite di sicurezza per questo prototipo
+ANNOUNCE_INTERVAL = 3
+PEER_TIMEOUT = 10
+MAX_FILE_SIZE = 20 * 1024 * 1024
+SEND_CHUNK = 64 * 1024
 
 
 class PeerNode:
     def __init__(self, hostname, on_peer_update, on_message, on_log):
-        """
-        on_peer_update(dict)      -> chiamata quando la lista peer cambia (aggiunta o rimozione)
-        on_message(sender, text)  -> chiamata quando arriva un messaggio o un file
-        on_log(level, msg)        -> chiamata per specchiare i log anche su una UI
-        """
         self.hostname = hostname
         self.logger, self.log_filepath = setup_logging(hostname)
         self.broadcast_addr = get_broadcast_address()
 
-        self.known_peers = {}  # hostname -> (ip, last_seen_timestamp)
+        self.known_peers = {}
         self.lock = threading.Lock()
 
         self.on_peer_update = on_peer_update
@@ -45,7 +43,8 @@ class PeerNode:
 
         self.private_key, self.public_key = crypto_utils.generate_keypair()
 
-    # ---------------- logging ----------------
+        self.transfer_log = TransferLog()
+        self.message_log = MessageLog()
 
     def log(self, level, msg):
         getattr(self.logger, level)(msg)
@@ -66,6 +65,19 @@ class PeerNode:
             except OSError as e:
                 self.log('warning', f"Broadcast fallito: {e}")
             time.sleep(ANNOUNCE_INTERVAL)
+
+    def announce_goodbye(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        msg = json.dumps({'type': 'goodbye', 'hostname': self.hostname}).encode()
+        try:
+            sock.sendto(msg, (self.broadcast_addr, DISCOVERY_PORT))
+            sock.sendto(msg, ('255.255.255.255', DISCOVERY_PORT))
+            self.log('info', "Annuncio di uscita inviato")
+        except OSError as e:
+            self.log('warning', f"Impossibile inviare goodbye: {e}")
+        finally:
+            sock.close()
 
     def listen_discovery(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -90,7 +102,21 @@ class PeerNode:
             except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                 continue
 
-            if msg.get('type') != 'announce':
+            msg_type = msg.get('type')
+
+            if msg_type == 'goodbye':
+                peer_host = msg.get('hostname')
+                if peer_host and peer_host != self.hostname:
+                    with self.lock:
+                        existed = peer_host in self.known_peers
+                        if existed:
+                            del self.known_peers[peer_host]
+                    if existed:
+                        self.log('info', f"Peer '{peer_host}' uscito volontariamente")
+                        self.on_peer_update(self.get_peers_snapshot())
+                continue
+
+            if msg_type != 'announce':
                 continue
 
             peer_host = msg.get('hostname')
@@ -108,7 +134,6 @@ class PeerNode:
                 self.on_peer_update(self.get_peers_snapshot())
 
     def prune_dead_peers(self):
-        """Rimuove periodicamente i peer che non annunciano da più di PEER_TIMEOUT secondi."""
         while True:
             time.sleep(2)
             now = time.time()
@@ -160,7 +185,7 @@ class PeerNode:
 
     def _handle_incoming(self, conn, addr):
         try:
-            conn.settimeout(15)
+            conn.settimeout(30)
 
             their_pubkey_bytes = conn.recv(32)
             conn.send(crypto_utils.pubkey_to_bytes(self.public_key))
@@ -179,9 +204,24 @@ class PeerNode:
             plaintext_bytes = crypto_utils.decrypt(shared_key, nonce, ciphertext)
 
             if packet.get('type') == 'file':
-                self._save_received_file(sender, packet.get('filename', 'file_ricevuto.bin'), plaintext_bytes)
+                name_len = int.from_bytes(plaintext_bytes[:2], 'big')
+                offset = 2
+                filename = plaintext_bytes[offset:offset + name_len].decode('utf-8')
+                offset += name_len
+                expected_hash = plaintext_bytes[offset:offset + 64].decode('utf-8')
+                offset += 64
+                file_content = plaintext_bytes[offset:]
+
+                actual_hash = hashlib.sha256(file_content).hexdigest()
+                if actual_hash != expected_hash:
+                    self.log('error', f"Hash mismatch per file da '{sender}': atteso {expected_hash[:12]}..., ottenuto {actual_hash[:12]}...")
+                    self.on_message(sender, f"[FILE CORROTTO] {filename} — verifica integrità fallita, scartato")
+                    return
+
+                self._save_received_file(sender, filename, file_content)
             else:
                 self.log('info', f"Messaggio ricevuto da '{sender}'")
+                self.message_log.add_entry('received', sender, plaintext_bytes.decode())
                 self.on_message(sender, plaintext_bytes.decode())
 
         except Exception as e:
@@ -190,8 +230,7 @@ class PeerNode:
             conn.close()
 
     def _save_received_file(self, sender, filename, file_bytes):
-        save_dir = os.path.join(os.path.expanduser("~"), "p2p_received_files")
-        os.makedirs(save_dir, exist_ok=True)
+        save_dir = received_dir_for_peer(sender)
         save_path = os.path.join(save_dir, filename)
 
         base, ext = os.path.splitext(save_path)
@@ -204,42 +243,16 @@ class PeerNode:
             f.write(file_bytes)
 
         self.log('info', f"File ricevuto da '{sender}': salvato in {save_path}")
+        self.transfer_log.add_entry('received', sender, filename, save_path, len(file_bytes))
         self.on_message(sender, f"[FILE] {filename} salvato in {save_path}")
 
     # ---------------- invio (in uscita) ----------------
-
-    def _send_packet(self, target_hostname, packet_dict, log_label):
-        target_ip = self.resolve(target_hostname)
-        if not target_ip:
-            self.log('warning', f"Hostname '{target_hostname}' sconosciuto")
-            return False, "hostname sconosciuto"
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(15)
-        try:
-            sock.connect((target_ip, LISTEN_PORT))
-            sock.send(crypto_utils.pubkey_to_bytes(self.public_key))
-            their_pubkey_bytes = sock.recv(32)
-            shared_key = crypto_utils.derive_shared_key(self.private_key, their_pubkey_bytes)
-
-            payload = json.dumps(packet_dict).encode()
-            sock.send(len(payload).to_bytes(8, 'big'))
-            sock.sendall(payload)
-
-            self.log('info', f"{log_label} inviato a '{target_hostname}'")
-            return True, None
-        except Exception as e:
-            self.log('error', f"Invio a {target_hostname} fallito: {e}")
-            return False, str(e)
-        finally:
-            sock.close()
 
     def send_message(self, target_hostname, message):
         target_ip = self.resolve(target_hostname)
         if not target_ip:
             return False, "hostname sconosciuto"
 
-        # handshake + cifratura fatti qui per poter derivare shared_key su questo scambio specifico
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(5)
         try:
@@ -260,6 +273,7 @@ class PeerNode:
             sock.sendall(payload)
 
             self.log('info', f"Messaggio inviato a '{target_hostname}'")
+            self.message_log.add_entry('sent', target_hostname, message)
             return True, None
         except Exception as e:
             self.log('error', f"Invio a {target_hostname} fallito: {e}")
@@ -267,7 +281,7 @@ class PeerNode:
         finally:
             sock.close()
 
-    def send_file(self, target_hostname, filepath):
+    def send_file(self, target_hostname, filepath, on_progress=None):
         if not os.path.isfile(filepath):
             self.log('error', f"File non trovato: {filepath}")
             return False, "file non trovato"
@@ -283,7 +297,7 @@ class PeerNode:
 
         filename = os.path.basename(filepath)
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(30)
+        sock.settimeout(60)
         try:
             sock.connect((target_ip, LISTEN_PORT))
             sock.send(crypto_utils.pubkey_to_bytes(self.public_key))
@@ -293,19 +307,38 @@ class PeerNode:
             with open(filepath, 'rb') as f:
                 file_bytes = f.read()
 
-            nonce, ciphertext = crypto_utils.encrypt(shared_key, file_bytes)
+            file_hash = hashlib.sha256(file_bytes).hexdigest()
+            filename_bytes = filename.encode('utf-8')
+            hash_bytes = file_hash.encode('utf-8')
+
+            if len(filename_bytes) > 65535:
+                self.log('error', f"Nome file troppo lungo: {filename}")
+                return False, "nome file troppo lungo"
+
+            name_len_header = len(filename_bytes).to_bytes(2, 'big')
+            combined = name_len_header + filename_bytes + hash_bytes + file_bytes
+
+            nonce, ciphertext = crypto_utils.encrypt(shared_key, combined)
             packet = {
                 'type': 'file',
-                'filename': filename,
                 'nonce': base64.b64encode(nonce).decode(),
                 'ciphertext': base64.b64encode(ciphertext).decode(),
                 'from': self.hostname
             }
             payload = json.dumps(packet).encode()
-            sock.send(len(payload).to_bytes(8, 'big'))
-            sock.sendall(payload)
+            total_len = len(payload)
+            sock.send(total_len.to_bytes(8, 'big'))
 
-            self.log('info', f"File '{filename}' ({filesize} byte) inviato a '{target_hostname}'")
+            sent = 0
+            while sent < total_len:
+                chunk = payload[sent:sent + SEND_CHUNK]
+                sock.sendall(chunk)
+                sent += len(chunk)
+                if on_progress:
+                    on_progress(sent, total_len)
+
+            self.log('info', f"File '{filename}' ({filesize} byte) inviato a '{target_hostname}' (hash {file_hash[:12]}...)")
+            self.transfer_log.add_entry('sent', target_hostname, filename, filepath, filesize)
             return True, None
         except Exception as e:
             self.log('error', f"Invio file a {target_hostname} fallito: {e}")
