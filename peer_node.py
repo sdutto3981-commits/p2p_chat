@@ -1,8 +1,11 @@
 """
-Core P2P: discovery via broadcast UDP, handshake X25519,
+Core P2P: discovery via broadcast UDP (LAN), handshake X25519,
 invio/ricezione di messaggi testuali e file cifrati con AES-GCM,
-lifecycle dei peer (aggiunta, rimozione per inattività, uscita volontaria),
-verifica di integrità via SHA-256, progress callback per invii grandi.
+lifecycle dei peer, verifica di integrità via SHA-256, progress
+callback per invii grandi, e routing ibrido: se il target non è
+raggiungibile in LAN, tenta l'invio tramite Relay Server (fuori
+rete locale), usando i contatti salvati via contact card.
+Invio file supportato sia via LAN che via relay.
 """
 
 import socket
@@ -19,6 +22,10 @@ from network_utils import get_broadcast_address, recv_exact
 from transfer_log import TransferLog
 from message_log import MessageLog
 from app_paths import received_dir_for_peer
+from identity import get_or_create_identity
+from relay_client import RelayClient
+from contacts import ContactsStore
+from contact_card import create_card, parse_card
 
 LISTEN_PORT = 9999
 DISCOVERY_PORT = 9998
@@ -26,6 +33,10 @@ ANNOUNCE_INTERVAL = 3
 PEER_TIMEOUT = 10
 MAX_FILE_SIZE = 20 * 1024 * 1024
 SEND_CHUNK = 64 * 1024
+
+# Cambia in "p2p-relay-stefano.fly.dev" quando pronto per il deploy reale su Fly.io
+RELAY_HOST = "p2p-relay-stefano.fly.dev"
+RELAY_PORT = 8443
 
 
 class PeerNode:
@@ -41,16 +52,39 @@ class PeerNode:
         self.on_message = on_message
         self.on_log = on_log
 
-        self.private_key, self.public_key = crypto_utils.generate_keypair()
+        self.x25519_private_key, self.ed25519_private_key = get_or_create_identity()
+        self.private_key = self.x25519_private_key
+        self.public_key = self.x25519_private_key.public_key()
 
         self.transfer_log = TransferLog()
         self.message_log = MessageLog()
+        self.contacts = ContactsStore()
+        self.relay_client = None
 
     def log(self, level, msg):
         getattr(self.logger, level)(msg)
         self.on_log(level, msg)
 
-    # ---------------- discovery ----------------
+    # ---------------- identità / contatti remoti ----------------
+
+    def get_my_contact_card(self):
+        return create_card(self.hostname, self.ed25519_private_key, self.x25519_private_key)
+
+    def add_contact_from_card(self, card_string):
+        try:
+            parsed = parse_card(card_string)
+        except ValueError as e:
+            return False, str(e)
+
+        self.contacts.add_contact(
+            parsed['hostname'],
+            parsed['ed25519_pub_hex'],
+            parsed['x25519_pub_bytes'].hex()
+        )
+        self.log('info', f"Contatto remoto aggiunto: '{parsed['hostname']}'")
+        return True, parsed['hostname']
+
+    # ---------------- discovery LAN ----------------
 
     def announce_presence(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -159,7 +193,7 @@ class PeerNode:
             entry = self.known_peers.get(hostname)
             return entry[0] if entry else None
 
-    # ---------------- listener P2P (in ingresso) ----------------
+    # ---------------- listener P2P LAN (in ingresso) ----------------
 
     def listen_p2p(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -197,37 +231,49 @@ class PeerNode:
             raw_payload = recv_exact(conn, payload_len)
 
             packet = json.loads(raw_payload.decode())
-            nonce = base64.b64decode(packet['nonce'])
-            ciphertext = base64.b64decode(packet['ciphertext'])
-            sender = packet.get('from', addr[0])
-
-            plaintext_bytes = crypto_utils.decrypt(shared_key, nonce, ciphertext)
-
-            if packet.get('type') == 'file':
-                name_len = int.from_bytes(plaintext_bytes[:2], 'big')
-                offset = 2
-                filename = plaintext_bytes[offset:offset + name_len].decode('utf-8')
-                offset += name_len
-                expected_hash = plaintext_bytes[offset:offset + 64].decode('utf-8')
-                offset += 64
-                file_content = plaintext_bytes[offset:]
-
-                actual_hash = hashlib.sha256(file_content).hexdigest()
-                if actual_hash != expected_hash:
-                    self.log('error', f"Hash mismatch per file da '{sender}': atteso {expected_hash[:12]}..., ottenuto {actual_hash[:12]}...")
-                    self.on_message(sender, f"[FILE CORROTTO] {filename} — verifica integrità fallita, scartato")
-                    return
-
-                self._save_received_file(sender, filename, file_content)
-            else:
-                self.log('info', f"Messaggio ricevuto da '{sender}'")
-                self.message_log.add_entry('received', sender, plaintext_bytes.decode())
-                self.on_message(sender, plaintext_bytes.decode())
+            self._process_decrypted_packet(packet, shared_key, sender_hint=addr)
 
         except Exception as e:
             self.log('error', f"Errore gestendo {addr}: {type(e).__name__}: {e}")
         finally:
             conn.close()
+
+    def _handle_relay_message(self, from_pubkey_hex, payload_dict):
+        try:
+            packet = payload_dict
+            sender_x25519_pub_bytes = bytes.fromhex(packet['sender_x25519_pub'])
+            shared_key = crypto_utils.derive_shared_key(self.x25519_private_key, sender_x25519_pub_bytes)
+            self._process_decrypted_packet(packet, shared_key, sender_hint=f"relay:{from_pubkey_hex[:12]}")
+        except Exception as e:
+            self.log('error', f"Errore gestendo pacchetto relay da {from_pubkey_hex[:12]}...: {e}")
+
+    def _process_decrypted_packet(self, packet, shared_key, sender_hint):
+        nonce = base64.b64decode(packet['nonce'])
+        ciphertext = base64.b64decode(packet['ciphertext'])
+        sender = packet.get('from', str(sender_hint))
+
+        plaintext_bytes = crypto_utils.decrypt(shared_key, nonce, ciphertext)
+
+        if packet.get('type') == 'file':
+            name_len = int.from_bytes(plaintext_bytes[:2], 'big')
+            offset = 2
+            filename = plaintext_bytes[offset:offset + name_len].decode('utf-8')
+            offset += name_len
+            expected_hash = plaintext_bytes[offset:offset + 64].decode('utf-8')
+            offset += 64
+            file_content = plaintext_bytes[offset:]
+
+            actual_hash = hashlib.sha256(file_content).hexdigest()
+            if actual_hash != expected_hash:
+                self.log('error', f"Hash mismatch per file da '{sender}'")
+                self.on_message(sender, f"[FILE CORROTTO] {filename} — verifica integrità fallita")
+                return
+
+            self._save_received_file(sender, filename, file_content)
+        else:
+            self.log('info', f"Messaggio ricevuto da '{sender}'")
+            self.message_log.add_entry('received', sender, plaintext_bytes.decode())
+            self.on_message(sender, plaintext_bytes.decode())
 
     def _save_received_file(self, sender, filename, file_bytes):
         save_dir = received_dir_for_peer(sender)
@@ -246,13 +292,44 @@ class PeerNode:
         self.transfer_log.add_entry('received', sender, filename, save_path, len(file_bytes))
         self.on_message(sender, f"[FILE] {filename} salvato in {save_path}")
 
-    # ---------------- invio (in uscita) ----------------
+    # ---------------- relay (fuori LAN) ----------------
+
+    def _start_relay(self):
+        def relay_loop():
+            while True:
+                self.relay_client = RelayClient(
+                    RELAY_HOST, RELAY_PORT,
+                    self.x25519_private_key, self.ed25519_private_key,
+                    self.hostname,
+                    on_relay_message=self._handle_relay_message,
+                    on_log=self.on_log
+                )
+                if self.relay_client.connect_and_authenticate():
+                    self.relay_client.start()
+                    self.log('info', "Connesso al relay server")
+                    while self.relay_client.connected:
+                        time.sleep(1)
+                    self.log('warning', "Connessione relay persa, riconnessione tra 5s...")
+                else:
+                    self.log('warning', "Autenticazione relay fallita, riprovo tra 5s...")
+                time.sleep(5)
+
+        threading.Thread(target=relay_loop, name="RelayConnection", daemon=True).start()
+
+    # ---------------- invio messaggi (routing ibrido) ----------------
 
     def send_message(self, target_hostname, message):
         target_ip = self.resolve(target_hostname)
-        if not target_ip:
-            return False, "hostname sconosciuto"
+        if target_ip:
+            return self._send_message_lan(target_hostname, target_ip, message)
 
+        ed25519_pub_hex, x25519_pub_hex = self.contacts.get_by_hostname(target_hostname)
+        if ed25519_pub_hex:
+            return self._send_message_relay(target_hostname, ed25519_pub_hex, x25519_pub_hex, message)
+
+        return False, "hostname sconosciuto (né in LAN né tra i contatti remoti)"
+
+    def _send_message_lan(self, target_hostname, target_ip, message):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(5)
         try:
@@ -272,14 +349,43 @@ class PeerNode:
             sock.send(len(payload).to_bytes(8, 'big'))
             sock.sendall(payload)
 
-            self.log('info', f"Messaggio inviato a '{target_hostname}'")
+            self.log('info', f"Messaggio inviato a '{target_hostname}' (via LAN)")
             self.message_log.add_entry('sent', target_hostname, message)
             return True, None
         except Exception as e:
-            self.log('error', f"Invio a {target_hostname} fallito: {e}")
+            self.log('error', f"Invio LAN a {target_hostname} fallito: {e}")
             return False, str(e)
         finally:
             sock.close()
+
+    def _send_message_relay(self, target_hostname, target_ed25519_pub_hex, target_x25519_pub_hex, message):
+        if not self.relay_client or not self.relay_client.connected:
+            return False, "non connesso al relay server"
+
+        online, _ = self.relay_client.lookup(target_ed25519_pub_hex)
+        if not online:
+            return False, f"'{target_hostname}' non è online sul relay al momento"
+
+        target_x25519_pub_bytes = bytes.fromhex(target_x25519_pub_hex)
+        shared_key = crypto_utils.derive_shared_key(self.x25519_private_key, target_x25519_pub_bytes)
+
+        nonce, ciphertext = crypto_utils.encrypt(shared_key, message.encode())
+        packet = {
+            'type': 'text',
+            'nonce': base64.b64encode(nonce).decode(),
+            'ciphertext': base64.b64encode(ciphertext).decode(),
+            'from': self.hostname,
+            'sender_x25519_pub': crypto_utils.pubkey_to_bytes(self.x25519_private_key.public_key()).hex()
+        }
+
+        ok = self.relay_client.send_relay(target_ed25519_pub_hex, packet)
+        if ok:
+            self.log('info', f"Messaggio inviato a '{target_hostname}' (via relay)")
+            self.message_log.add_entry('sent', target_hostname, message)
+            return True, None
+        return False, "invio relay fallito"
+
+    # ---------------- invio file (routing ibrido) ----------------
 
     def send_file(self, target_hostname, filepath, on_progress=None):
         if not os.path.isfile(filepath):
@@ -292,9 +398,27 @@ class PeerNode:
             return False, "file troppo grande per questo prototipo"
 
         target_ip = self.resolve(target_hostname)
-        if not target_ip:
-            return False, "hostname sconosciuto"
+        if target_ip:
+            return self._send_file_lan(target_hostname, target_ip, filepath, filesize, on_progress)
 
+        ed25519_pub_hex, x25519_pub_hex = self.contacts.get_by_hostname(target_hostname)
+        if ed25519_pub_hex:
+            return self._send_file_relay(target_hostname, ed25519_pub_hex, x25519_pub_hex, filepath, filesize, on_progress)
+
+        return False, "hostname sconosciuto (né in LAN né tra i contatti remoti)"
+
+    def _build_file_blob(self, filename, filepath):
+        """Costruisce il blob [len_nome][nome][hash][contenuto], condiviso da LAN e relay."""
+        with open(filepath, 'rb') as f:
+            file_bytes = f.read()
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
+        filename_bytes = filename.encode('utf-8')
+        if len(filename_bytes) > 65535:
+            raise ValueError("Nome file troppo lungo")
+        name_len_header = len(filename_bytes).to_bytes(2, 'big')
+        return name_len_header + filename_bytes + file_hash.encode('utf-8') + file_bytes
+
+    def _send_file_lan(self, target_hostname, target_ip, filepath, filesize, on_progress):
         filename = os.path.basename(filepath)
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(60)
@@ -304,20 +428,7 @@ class PeerNode:
             their_pubkey_bytes = sock.recv(32)
             shared_key = crypto_utils.derive_shared_key(self.private_key, their_pubkey_bytes)
 
-            with open(filepath, 'rb') as f:
-                file_bytes = f.read()
-
-            file_hash = hashlib.sha256(file_bytes).hexdigest()
-            filename_bytes = filename.encode('utf-8')
-            hash_bytes = file_hash.encode('utf-8')
-
-            if len(filename_bytes) > 65535:
-                self.log('error', f"Nome file troppo lungo: {filename}")
-                return False, "nome file troppo lungo"
-
-            name_len_header = len(filename_bytes).to_bytes(2, 'big')
-            combined = name_len_header + filename_bytes + hash_bytes + file_bytes
-
+            combined = self._build_file_blob(filename, filepath)
             nonce, ciphertext = crypto_utils.encrypt(shared_key, combined)
             packet = {
                 'type': 'file',
@@ -337,14 +448,50 @@ class PeerNode:
                 if on_progress:
                     on_progress(sent, total_len)
 
-            self.log('info', f"File '{filename}' ({filesize} byte) inviato a '{target_hostname}' (hash {file_hash[:12]}...)")
+            self.log('info', f"File '{filename}' ({filesize} byte) inviato a '{target_hostname}' (via LAN)")
             self.transfer_log.add_entry('sent', target_hostname, filename, filepath, filesize)
             return True, None
         except Exception as e:
-            self.log('error', f"Invio file a {target_hostname} fallito: {e}")
+            self.log('error', f"Invio file LAN a {target_hostname} fallito: {e}")
             return False, str(e)
         finally:
             sock.close()
+
+    def _send_file_relay(self, target_hostname, target_ed25519_pub_hex, target_x25519_pub_hex, filepath, filesize, on_progress):
+        if not self.relay_client or not self.relay_client.connected:
+            return False, "non connesso al relay server"
+
+        online, _ = self.relay_client.lookup(target_ed25519_pub_hex)
+        if not online:
+            return False, f"'{target_hostname}' non è online sul relay al momento"
+
+        filename = os.path.basename(filepath)
+        target_x25519_pub_bytes = bytes.fromhex(target_x25519_pub_hex)
+        shared_key = crypto_utils.derive_shared_key(self.x25519_private_key, target_x25519_pub_bytes)
+
+        try:
+            combined = self._build_file_blob(filename, filepath)
+        except ValueError as e:
+            return False, str(e)
+
+        nonce, ciphertext = crypto_utils.encrypt(shared_key, combined)
+        packet = {
+            'type': 'file',
+            'nonce': base64.b64encode(nonce).decode(),
+            'ciphertext': base64.b64encode(ciphertext).decode(),
+            'from': self.hostname,
+            'sender_x25519_pub': crypto_utils.pubkey_to_bytes(self.x25519_private_key.public_key()).hex()
+        }
+
+        if on_progress:
+            on_progress(1, 1)  # invio atomico via relay, niente progress granulare per ora
+
+        ok = self.relay_client.send_relay(target_ed25519_pub_hex, packet)
+        if ok:
+            self.log('info', f"File '{filename}' ({filesize} byte) inviato a '{target_hostname}' (via relay)")
+            self.transfer_log.add_entry('sent', target_hostname, filename, filepath, filesize)
+            return True, None
+        return False, "invio file via relay fallito"
 
     # ---------------- lifecycle ----------------
 
@@ -353,3 +500,4 @@ class PeerNode:
         threading.Thread(target=self.announce_presence, name="Announcer", daemon=True).start()
         threading.Thread(target=self.listen_p2p, name="P2PListener", daemon=True).start()
         threading.Thread(target=self.prune_dead_peers, name="PeerPruner", daemon=True).start()
+        self._start_relay()

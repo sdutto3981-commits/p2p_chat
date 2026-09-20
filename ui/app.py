@@ -1,6 +1,6 @@
 """
 Applicazione Textual: layout a quattro colonne (grafo | chat | file | log),
-input testuale per comandi (send, sendfile, history, peers).
+input testuale per comandi (send, sendfile, history, peers, mycard, addcontact).
 """
 
 import os
@@ -97,7 +97,7 @@ class P2PApp(App):
                 self.chat_log = RichLog(id="chat_log", wrap=True, markup=True)
                 yield self.chat_log
                 self.input_box = Input(
-                    placeholder="send <host> <msg> | sendfile <host> <path> | history <host> | peers",
+                    placeholder="send <host> <msg> | sendfile <host> <path> | mycard | addcontact <card> | history <host> | peers",
                     id="input_box"
                 )
                 yield self.input_box
@@ -121,13 +121,9 @@ class P2PApp(App):
         self.input_box.focus()
 
     def action_quit(self):
-        # announce_goodbye chiama internamente self.log() -> on_log() -> call_from_thread(),
-        # che è valido solo se chiamato da un thread diverso da quello dell'app.
-        # action_quit gira nel thread principale, quindi va eseguito in un thread separato.
-        import threading
         t = threading.Thread(target=self.node.announce_goodbye, daemon=True)
         t.start()
-        t.join(timeout=1.0)  # aspetta al massimo 1 secondo che il broadcast parta, poi esce comunque
+        t.join(timeout=1.0)
         self.exit()
 
     # ---- callback dal thread di rete verso la UI ----
@@ -156,7 +152,21 @@ class P2PApp(App):
 
         if cmd == "peers":
             hosts = list(self.node.get_peers_snapshot().keys())
-            self.chat_log.write(f"[dim]Peer conosciuti: {hosts}[/dim]")
+            self.chat_log.write(f"[dim]Peer LAN conosciuti: {hosts}[/dim]")
+
+        elif cmd == "mycard":
+            card = self.node.get_my_contact_card()
+            self.chat_log.write(f"\n[bold]La tua contact card:[/bold]")
+            self.chat_log.write(f"[dim]{card}[/dim]")
+            self.chat_log.write("[dim](condividila con chi vuoi che ti contatti da remoto)[/dim]\n")
+
+        elif cmd.startswith("addcontact "):
+            card_string = cmd.split(" ", 1)[1].strip()
+            ok, result = self.node.add_contact_from_card(card_string)
+            if ok:
+                self.chat_log.write(f"[green]Contatto '{result}' aggiunto con successo[/green]")
+            else:
+                self.chat_log.write(f"[red]Errore aggiungendo contatto: {result}[/red]")
 
         elif cmd.startswith("history "):
             target = cmd.split(" ", 1)[1].strip()
